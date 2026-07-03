@@ -1,19 +1,17 @@
-"""LangGraph nodes  --  pure functions over GraphState."""
+"""LangGraph nodes for the main graph.
 
-from .analysis import analysis_agent
+The per-partner LLM nodes (analyze, chart, email) live in
+`payments_reporting.partner_pipeline` where the subgraph is wired.
+"""
+
 from .aggregate import aggregate
-from .charts import chart_generator
 from .dispatch import dispatch_emails
-from .email import email_agent
 from .ingest import ingest
 from .trigger import trigger
 
 __all__ = [
-    "analysis_agent",
     "aggregate",
-    "chart_generator",
     "dispatch_emails",
-    "email_agent",
     "ingest",
     "trigger",
 ]

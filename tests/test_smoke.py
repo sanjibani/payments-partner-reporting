@@ -1,8 +1,8 @@
 """Smoke tests for the payments reporting workflow.
 
 These run without any LLM call or external service. They cover the
-deterministic path: trigger -> ingest -> aggregate -> analysis_agent ->
-chart_generator -> email_agent -> dispatch_emails.
+deterministic path: trigger -> ingest -> aggregate -> Send fan-out to
+partner_pipeline (parallel) -> dispatch_emails -> END.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
+
+from langgraph.graph import END  # noqa: E402
 
 from payments_reporting.graph import build_graph, run_weekly  # noqa: E402
 from payments_reporting.state import (  # noqa: E402
@@ -141,8 +143,81 @@ def test_app_insights_csv_loader():
 def test_graph_compiles():
     """The graph builds without errors and has the expected node count."""
     g = build_graph()
-    expected = {"trigger", "ingest", "aggregate", "analysis_agent",
-                "chart_generator", "email_agent", "dispatch_emails"}
+    expected = {
+        "trigger",
+        "ingest",
+        "aggregate",
+        "partner_pipeline",
+        "dispatch_emails",
+        "alert_failure",
+    }
     # LangGraph adds a synthetic __start__ node automatically; ignore it.
     actual = {n for n in g.nodes if not n.startswith("__")}
     assert actual == expected
+
+
+@pytest.mark.asyncio
+async def test_fan_out_runs_per_partner():
+    """The Send fan-out should produce one analysis per partner."""
+    final = await run_weekly(
+        run_id="fanout-test",
+        dry_run=True,
+        out_dir="out/fanout-test",
+    )
+    analyses = final.get("analyses") or {}
+    assert set(analyses.keys()) == {"P-001", "P-002", "P-003"}
+
+
+def test_conditional_edge_routing_logic():
+    """The route_after_ingest function picks END when raw_metrics is empty,
+    otherwise routes to aggregate. Verifies the routing decision in
+    isolation (without running the full graph)."""
+    from payments_reporting.graph import route_after_ingest
+    from payments_reporting.state import initial_state
+
+    # Empty -> END
+    state = initial_state(run_id="x", dry_run=True)
+    state["raw_metrics"] = {}
+    assert route_after_ingest(state) == END
+
+    # Non-empty -> aggregate
+    state["raw_metrics"] = {"P-001": []}
+    assert route_after_ingest(state) == "aggregate"
+
+
+@pytest.mark.asyncio
+async def test_streaming_emits_node_events():
+    """graph.astream should yield events for each node."""
+    from payments_reporting.graph import stream_weekly
+
+    events: list[str] = []
+    async for event in stream_weekly(
+        run_id="stream-test",
+        dry_run=True,
+        out_dir="out/stream-test",
+    ):
+        events.extend(event.keys())
+    # trigger, ingest, aggregate, partner_pipeline (parallel),
+    # dispatch_emails should all fire.
+    assert "trigger" in events
+    assert "ingest" in events
+    assert "aggregate" in events
+    assert "dispatch_emails" in events
+
+
+def test_checkpoint_state_persisted():
+    """After a run, get_state returns the saved snapshot."""
+    import asyncio
+
+    from payments_reporting.graph import get_checkpoint_state
+
+    asyncio.run(
+        run_weekly(
+            run_id="checkpoint-test",
+            dry_run=True,
+            out_dir="out/checkpoint-test",
+        )
+    )
+    snap = get_checkpoint_state("checkpoint-test")
+    assert snap is not None
+    assert snap["run_id"] == "checkpoint-test"

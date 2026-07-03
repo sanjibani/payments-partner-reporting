@@ -42,6 +42,11 @@ def main(
     serve: bool = typer.Option(
         False, "--serve", help="Start the FastAPI service on :8080."
     ),
+    stream: bool = typer.Option(
+        False,
+        "--stream",
+        help="Print node-level events as they fire (uses graph.astream).",
+    ),
     out_dir: str | None = typer.Option(
         None, "--out-dir", help="Override the output directory."
     ),
@@ -66,21 +71,49 @@ def main(
         Panel(
             f"run_id: {run_id}\n"
             f"mode:   {'dry-run' if dry_run else 'live'}\n"
-            f"out:    {out_dir}",
+            f"out:    {out_dir}\n"
+            f"stream: {stream}",
             title="payments-partner-reporting",
         )
     )
 
-    from payments_reporting.graph import dump_state_json, run_weekly
-
-    final = asyncio.run(
-        run_weekly(run_id=run_id, dry_run=dry_run, out_dir=out_dir)
+    from payments_reporting.graph import (
+        dump_state_json,
+        run_weekly,
+        stream_weekly,
     )
 
-    # Persist state.json for inspection and replay.
-    Path(out_dir, "state.json").write_text(
-        dump_state_json(final), encoding="utf-8"
-    )
+    if stream:
+        # Live event printing. Each graph.astream event is
+        # dict[node_name, partial_state].
+        final_state: dict = {}
+        from rich.live import Live
+        from rich.table import Table
+
+        async def _run_with_events():
+            nonlocal final_state
+            async for event in stream_weekly(
+                run_id=run_id, dry_run=dry_run, out_dir=out_dir
+            ):
+                for node_name, partial in event.items():
+                    final_state.update(partial or {})
+                    keys = list((partial or {}).keys())
+                    console.print(
+                        f"  [cyan]{node_name}[/cyan] -> {keys}"
+                    )
+
+        asyncio.run(_run_with_events())
+        final = final_state
+        Path(out_dir, "state.json").write_text(
+            dump_state_json(final), encoding="utf-8"  # type: ignore[arg-type]
+        )
+    else:
+        final = asyncio.run(
+            run_weekly(run_id=run_id, dry_run=dry_run, out_dir=out_dir)
+        )
+        Path(out_dir, "state.json").write_text(
+            dump_state_json(final), encoding="utf-8"
+        )
 
     errs = final.get("errors") or []
     if errs:

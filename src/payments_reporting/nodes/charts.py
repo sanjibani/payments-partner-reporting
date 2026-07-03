@@ -1,11 +1,8 @@
-"""chart_generator node: deterministic PNG charts from a PartnerSummary.
+"""Deterministic matplotlib charts for a PartnerSummary.
 
-Input:  one PartnerSummary (and optionally an AnalysisOutput for chart titles)
-Output: list[ChartFile]
-
-No LLM. matplotlib only. Output lands in
-out/<run_id>/partners/<partner_id>/charts/<kind>.png and the path is
-embedded in state so the email_agent can reference it.
+The graph node (`partner_chart`) lives in `partner_pipeline.py`. This
+module exposes the chart-rendering helpers that the subgraph node
+uses.
 """
 
 from __future__ import annotations
@@ -18,17 +15,24 @@ import matplotlib
 matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
-from ..state import AnalysisOutput, ChartFile, GraphState, PartnerSummary
+from ..state import ChartFile, PartnerSummary
 
 log = logging.getLogger(__name__)
 
 
-def _success_rate_bar(summary: PartnerSummary, out_path: Path) -> ChartFile:
+def success_rate_bar(summary: PartnerSummary, out_path: Path) -> ChartFile:
     gateways = [g.gateway for g in summary.by_gateway]
     rates = [g.success_rate * 100 for g in summary.by_gateway]
 
     fig, ax = plt.subplots(figsize=(6, 3.5))
-    bars = ax.bar(gateways, rates, color=["#4caf50" if r >= 90 else "#ff9800" if r >= 70 else "#f44336" for r in rates])
+    bars = ax.bar(
+        gateways,
+        rates,
+        color=[
+            "#4caf50" if r >= 90 else "#ff9800" if r >= 70 else "#f44336"
+            for r in rates
+        ],
+    )
     ax.set_ylabel("Success rate (%)")
     ax.set_ylim(0, 100)
     ax.set_title(f"Success rate by gateway  --  {summary.partner_name}")
@@ -50,7 +54,7 @@ def _success_rate_bar(summary: PartnerSummary, out_path: Path) -> ChartFile:
     )
 
 
-def _failure_buckets(summary: PartnerSummary, out_path: Path) -> ChartFile:
+def failure_buckets(summary: PartnerSummary, out_path: Path) -> ChartFile:
     buckets = summary.top_failures
     if not buckets:
         fig, ax = plt.subplots(figsize=(6, 3))
@@ -73,7 +77,7 @@ def _failure_buckets(summary: PartnerSummary, out_path: Path) -> ChartFile:
     )
 
 
-def _wow_trend(summary: PartnerSummary, out_path: Path) -> ChartFile:
+def wow_trend(summary: PartnerSummary, out_path: Path) -> ChartFile:
     rates = [t for t in summary.trends if t.metric.endswith("_success_rate")]
     if not rates:
         fig, ax = plt.subplots(figsize=(6, 3))
@@ -85,8 +89,20 @@ def _wow_trend(summary: PartnerSummary, out_path: Path) -> ChartFile:
         last_w = [t.last_week for t in rates]
         fig, ax = plt.subplots(figsize=(6, 3.5))
         x = range(len(labels))
-        ax.bar([i - 0.2 for i in x], last_w, width=0.4, label="Last week", color="#90a4ae")
-        ax.bar([i + 0.2 for i in x], this_w, width=0.4, label="This week", color="#42a5f5")
+        ax.bar(
+            [i - 0.2 for i in x],
+            last_w,
+            width=0.4,
+            label="Last week",
+            color="#90a4ae",
+        )
+        ax.bar(
+            [i + 0.2 for i in x],
+            this_w,
+            width=0.4,
+            label="This week",
+            color="#42a5f5",
+        )
         ax.set_xticks(list(x))
         ax.set_xticklabels(labels)
         ax.set_ylabel("Success rate (%)")
@@ -102,29 +118,22 @@ def _wow_trend(summary: PartnerSummary, out_path: Path) -> ChartFile:
     )
 
 
-async def chart_generator(state: GraphState) -> dict:
-    summaries: dict[str, PartnerSummary] = state.get("partner_summaries") or {}
-    analyses: dict[str, AnalysisOutput] = state.get("analyses") or {}
-    out_dir = Path(state.get("out_dir", f"out/{state['run_id']}"))  # type: ignore[arg-type]
+def render_partner_charts(
+    summary: PartnerSummary, out_dir: Path
+) -> list[ChartFile]:
+    """Render all three charts for a partner to out_dir/charts/."""
+    charts_dir = out_dir / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        success_rate_bar(summary, charts_dir / "success_rate.png"),
+        failure_buckets(summary, charts_dir / "failures.png"),
+        wow_trend(summary, charts_dir / "wow.png"),
+    ]
 
-    charts: dict[str, list[ChartFile]] = {}
-    for pid, summary in summaries.items():
-        partner_dir = out_dir / "partners" / pid / "charts"
-        partner_dir.mkdir(parents=True, exist_ok=True)
-        chart_list = [
-            _success_rate_bar(summary, partner_dir / "success_rate.png"),
-            _failure_buckets(summary, partner_dir / "failures.png"),
-            _wow_trend(summary, partner_dir / "wow.png"),
-        ]
-        # Optionally enrich titles from the LLM analysis
-        if pid in analyses:
-            analysis = analyses[pid]
-            if analysis.recommended_actions:
-                chart_list[0].title = (
-                    f"Success rate by gateway  --  recommended: "
-                    f"{analysis.recommended_actions[0][:60]}"
-                )
-        charts[pid] = chart_list
 
-    log.info("chart_generator.done partners=%d charts/partner=%d", len(charts), 3)
-    return {"charts": charts, "out_dir": str(out_dir)}
+__all__ = [
+    "failure_buckets",
+    "render_partner_charts",
+    "success_rate_bar",
+    "wow_trend",
+]

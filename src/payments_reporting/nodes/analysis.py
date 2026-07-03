@@ -1,25 +1,23 @@
-"""analysis_agent node: LLM turns each PartnerSummary into a structured AnalysisOutput.
+"""Helpers for the analysis LLM call.
 
-Input:  one PartnerSummary (per partner)
-Output: AnalysisOutput (overview, key_issues, likely_causes, recommended_actions)
-
-Falls back to a deterministic template if the LLM is unavailable so the
-weekly batch never blocks on a model outage.
+The actual graph node (`partner_analyze`) lives in `partner_pipeline.py`
+where the per-partner subgraph is wired. This module exposes the
+deterministic fallback and the per-partner LLM helper that the
+subgraph node uses.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 from ..llm import LLMClient
 from ..prompts import ANALYSIS_SYSTEM, analysis_user_prompt
-from ..state import AnalysisOutput, GraphState, PartnerSummary
+from ..state import AnalysisOutput, PartnerSummary
 
 log = logging.getLogger(__name__)
 
 
-def _fallback_analysis(summary: PartnerSummary) -> AnalysisOutput:
+def fallback_analysis(summary: PartnerSummary) -> AnalysisOutput:
     """Deterministic output when LLM is disabled or fails.
 
     Honest, short, grounded only in numbers the code computed. Same
@@ -30,8 +28,7 @@ def _fallback_analysis(summary: PartnerSummary) -> AnalysisOutput:
         f"{b.gateway} returned {b.result_code} {b.count} times this week"
         for b in top
     ] or ["No notable failure spike this week"]
-    anomalies = [t.metric for t in summary.trends if t.is_anomaly]
-    actions = []
+    actions: list[str] = []
     for t in summary.trends:
         if t.is_anomaly:
             actions.append(
@@ -50,33 +47,22 @@ def _fallback_analysis(summary: PartnerSummary) -> AnalysisOutput:
     )
 
 
-async def _analyse_one(
+async def analyze_one(
     llm: LLMClient, summary: PartnerSummary
 ) -> AnalysisOutput:
+    """Run one partner's analysis. Used by the subgraph node."""
     summary_json = summary.model_dump_json(indent=2)
     user = analysis_user_prompt(summary_json, summary.partner_name)
     try:
         data = llm.complete_json(ANALYSIS_SYSTEM, user)
         return AnalysisOutput.model_validate(data)
-    except Exception as e:  # noqa: BLE001  --  graceful degradation
+    except Exception as e:  # noqa: BLE001
         log.warning(
-            "analysis_agent.fallback partner=%s reason=%s",
+            "analyze_one.fallback partner=%s reason=%s",
             summary.partner_id,
             e,
         )
-        return _fallback_analysis(summary)
+        return fallback_analysis(summary)
 
 
-async def analysis_agent(state: GraphState) -> dict:
-    summaries: dict[str, PartnerSummary] = state.get("partner_summaries") or {}
-    llm = LLMClient(disabled=bool(state.get("dry_run")))
-
-    out: dict[str, AnalysisOutput] = {}
-    for pid, summary in summaries.items():
-        out[pid] = await _analyse_one(llm, summary)
-
-    log.info("analysis_agent.done partners=%d", len(out))
-    return {"analyses": out}
-
-
-__all__ = ["analysis_agent"]
+__all__ = ["analyze_one", "fallback_analysis"]

@@ -9,9 +9,21 @@ README.md.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, NotRequired, TypedDict
+from typing import Annotated, Any, NotRequired, TypedDict
 
 from pydantic import BaseModel, Field
+
+
+def _merge_dicts(old: dict, new: dict) -> dict:
+    """Reducer that merges two dicts (new keys win on conflict).
+
+    Used for partner-keyed fields like analyses / charts / email_bodies
+    so concurrent writes from Send fan-out branches accumulate into one
+    dict instead of triggering INVALID_CONCURRENT_GRAPH_UPDATE.
+    """
+    merged = dict(old or {})
+    merged.update(new or {})
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +158,11 @@ class GraphState(TypedDict):
 
     Each node reads what it needs and writes what it produces. In
     interviews, point at the per-node I/O table in README.md.
+
+    Note: partner_summaries, analyses, charts, and email_bodies are all
+    keyed by partner_id. That is what lets the per-partner parallel
+    fan-out (via Send API) merge cleanly back into the main state --
+    each branch writes its own key.
     """
 
     # control
@@ -154,16 +171,19 @@ class GraphState(TypedDict):
     week_start: NotRequired[datetime]
     week_end: NotRequired[datetime]
     partners: NotRequired[list[PartnerMeta]]
+    out_dir: NotRequired[str]
 
     # raw + aggregated
     raw_metrics: NotRequired[dict[str, list[RawRow]]]
     partner_summaries: NotRequired[dict[str, PartnerSummary]]
     last_week_metrics: NotRequired[dict[str, list[RawRow]]]  # for WoW
 
-    # LLM artefacts
-    analyses: NotRequired[dict[str, AnalysisOutput]]
-    charts: NotRequired[dict[str, list[ChartFile]]]
-    email_bodies: NotRequired[dict[str, EmailOutput]]
+    # LLM artefacts  --  each entry keyed by partner_id.
+    # Annotated reducers let concurrent Send fan-out branches write
+    # different keys without INVALID_CONCURRENT_GRAPH_UPDATE.
+    analyses: NotRequired[Annotated[dict[str, AnalysisOutput], _merge_dicts]]
+    charts: NotRequired[Annotated[dict[str, list[ChartFile]], _merge_dicts]]
+    email_bodies: NotRequired[Annotated[dict[str, EmailOutput], _merge_dicts]]
 
     # dispatch
     send_results: NotRequired[list[SendResult]]
@@ -171,6 +191,26 @@ class GraphState(TypedDict):
     # observability
     errors: NotRequired[list[str]]
     node_durations_ms: NotRequired[dict[str, float]]
+
+
+class PartnerPipelineState(TypedDict):
+    """Per-partner subgraph state.
+
+    Passed via the Send API after aggregate(). Each partner runs the
+    analyze -> chart -> email pipeline in parallel. Nodes in this
+    subgraph return partials that LangGraph merges back into the main
+    GraphState keyed by partner_id.
+
+    Note: this state intentionally does NOT include run_id, dry_run,
+    or out_dir. Those live in a module-level context (see
+    partner_pipeline.set_pipeline_ctx) so the subgraph final state has
+    no overlapping keys with the main GraphState. Without that
+    isolation, LangGraph's LastValue channel errors on concurrent
+    writes when multiple Send branches fan back in.
+    """
+
+    partner_id: str
+    summary: PartnerSummary
 
 
 def initial_state(run_id: str, dry_run: bool = False) -> GraphState:
@@ -191,6 +231,7 @@ __all__ = [
     "GatewayStat",
     "GraphState",
     "PartnerMeta",
+    "PartnerPipelineState",
     "PartnerSummary",
     "RawRow",
     "SendResult",
