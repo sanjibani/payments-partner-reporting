@@ -1,16 +1,16 @@
-"""CLI entrypoint for local development.
+"""CLI entrypoint for local development and ops.
 
 Examples:
     python scripts/run_local.py --seed
+    python scripts/run_local.py --dry-run
     python scripts/run_local.py --dry-run --partner P-001
-    python scripts/run_local.py --partner P-001
-    python scripts/run_local.py --serve   # start the FastAPI service on :8080
+    python scripts/run_local.py --dry-run --stream
+    python scripts/run_local.py --serve
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import uuid
@@ -35,24 +35,20 @@ def main(
         False, "--dry-run", help="Skip LLM calls and SMTP send."
     ),
     partner: str | None = typer.Option(
-        None,
-        "--partner",
-        help="Restrict to a single partner id (P-001, P-002, P-003).",
+        None, "--partner", help="Restrict to one partner id."
     ),
     serve: bool = typer.Option(
         False, "--serve", help="Start the FastAPI service on :8080."
     ),
     stream: bool = typer.Option(
-        False,
-        "--stream",
-        help="Print node-level events as they fire (uses graph.astream).",
+        False, "--stream", help="Print node-level events live."
     ),
     out_dir: str | None = typer.Option(
         None, "--out-dir", help="Override the output directory."
     ),
 ) -> None:
     if seed:
-        from scripts.seed_sample import main as seed_main  # type: ignore
+        from scripts.seed_sample import main as seed_main
 
         seed_main()
         return
@@ -61,8 +57,7 @@ def main(
         return
 
     run_id = uuid.uuid4().hex[:12]
-    if not out_dir:
-        out_dir = f"out/{run_id}"
+    out_dir = out_dir or f"out/{run_id}"
     os.environ.setdefault("WEEK_START_ISO", "2026-06-22T00:00:00+00:00")
     if partner:
         os.environ["PARTNERS_OVERRIDE"] = partner
@@ -84,29 +79,7 @@ def main(
     )
 
     if stream:
-        # Live event printing. Each graph.astream event is
-        # dict[node_name, partial_state].
-        final_state: dict = {}
-        from rich.live import Live
-        from rich.table import Table
-
-        async def _run_with_events():
-            nonlocal final_state
-            async for event in stream_weekly(
-                run_id=run_id, dry_run=dry_run, out_dir=out_dir
-            ):
-                for node_name, partial in event.items():
-                    final_state.update(partial or {})
-                    keys = list((partial or {}).keys())
-                    console.print(
-                        f"  [cyan]{node_name}[/cyan] -> {keys}"
-                    )
-
-        asyncio.run(_run_with_events())
-        final = final_state
-        Path(out_dir, "state.json").write_text(
-            dump_state_json(final), encoding="utf-8"  # type: ignore[arg-type]
-        )
+        _run_stream(run_id, dry_run, out_dir)
     else:
         final = asyncio.run(
             run_weekly(run_id=run_id, dry_run=dry_run, out_dir=out_dir)
@@ -114,7 +87,31 @@ def main(
         Path(out_dir, "state.json").write_text(
             dump_state_json(final), encoding="utf-8"
         )
+        _summarise(final, out_dir)
 
+
+def _run_stream(run_id: str, dry_run: bool, out_dir: str) -> None:
+    from payments_reporting.graph import dump_state_json, stream_weekly
+
+    async def _go() -> dict:
+        merged: dict = {}
+        async for event in stream_weekly(
+            run_id=run_id, dry_run=dry_run, out_dir=out_dir
+        ):
+            for node, partial in event.items():
+                merged.update(partial or {})
+                keys = list((partial or {}).keys())
+                console.print(f"  [cyan]{node}[/cyan] -> {keys}")
+        return merged
+
+    final = asyncio.run(_go())
+    Path(out_dir, "state.json").write_text(
+        dump_state_json(final), encoding="utf-8"
+    )
+    _summarise(final, out_dir)
+
+
+def _summarise(final: dict, out_dir: str) -> None:
     errs = final.get("errors") or []
     if errs:
         console.print("[red]Errors:[/red]")

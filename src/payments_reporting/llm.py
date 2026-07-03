@@ -9,7 +9,7 @@ https://api.minimax.io/v1. Two key behaviours:
 
 2. Safe-key logging: never log the full key.
 
-Pattern reference: ~/.mavis/agents/mavis/memory/llm-api-patterns.md
+Reference: ~/.mavis/agents/mavis/memory/llm-api-patterns.md
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from openai import OpenAI
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = "https://api.minimax.io/v1"
-_DEFAULT_MODEL = "MiniMax-Text-01"
+DEFAULT_BASE_URL = "https://api.minimax.io/v1"
+DEFAULT_MODEL = "MiniMax-Text-01"
 
 
 def _mask_key(key: str | None) -> str:
@@ -38,13 +38,11 @@ def _mask_key(key: str | None) -> str:
 
 
 class LLMClient:
-    """Thin wrapper over the MiniMax chat completions API.
-
-    Construct once per process; reuse across nodes.
-    """
+    """Thin wrapper over the MiniMax chat completions API."""
 
     def __init__(
         self,
+        *,
         api_key: str | None = None,
         base_url: str | None = None,
         model: str | None = None,
@@ -52,8 +50,8 @@ class LLMClient:
     ) -> None:
         load_dotenv()
         self.api_key = api_key or os.getenv("LLM_API_KEY", "")
-        self.base_url = base_url or os.getenv("LLM_BASE_URL", _DEFAULT_BASE_URL)
-        self.model = model or os.getenv("LLM_MODEL", _DEFAULT_MODEL)
+        self.base_url = base_url or os.getenv("LLM_BASE_URL", DEFAULT_BASE_URL)
+        self.model = model or os.getenv("LLM_MODEL", DEFAULT_MODEL)
         self.disabled = (
             disabled
             if disabled is not None
@@ -68,14 +66,14 @@ class LLMClient:
             self.disabled,
         )
 
-        if not self.disabled and self.api_key:
-            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        else:
-            self._client = None
+        self._client: OpenAI | None = (
+            OpenAI(api_key=self.api_key, base_url=self.base_url)
+            if (not self.disabled and self.api_key)
+            else None
+        )
 
     def is_available(self) -> bool:
-        """True if we have a key and the user has not disabled LLM calls."""
-        return bool(self._client) and not self.disabled
+        return self._client is not None and not self.disabled
 
     def complete(
         self,
@@ -85,11 +83,7 @@ class LLMClient:
         json_mode: bool = False,
         temperature: float = 0.2,
     ) -> str:
-        """Synchronous chat completion.
-
-        Returns the assistant message text. On any failure, raises so the
-        caller can fall back to a deterministic path.
-        """
+        """Synchronous chat completion. Raises on any failure."""
         if not self.is_available():
             raise RuntimeError("LLM disabled or API key missing")
 
@@ -107,8 +101,7 @@ class LLMClient:
 
         log.info("llm.call model=%s json=%s", self.model, json_mode)
         resp = self._client.chat.completions.create(**kwargs)
-        content = resp.choices[0].message.content or ""
-        return content.strip()
+        return (resp.choices[0].message.content or "").strip()
 
     def complete_json(
         self, system: str, user: str, *, temperature: float = 0.2
@@ -120,7 +113,8 @@ class LLMClient:
 
 
 def _strip_code_fence(text: str) -> str:
-    """Some models return ```json ... ``` even when response_format is set."""
+    """Some models wrap their JSON output in ```json ... ``` even when
+    response_format is set. Strip it before json.loads."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
@@ -128,23 +122,4 @@ def _strip_code_fence(text: str) -> str:
     return text.strip()
 
 
-# ---------------------------------------------------------------------------
-# Singleton helpers  --  convenient for CLI use; the FastAPI app builds its
-# own LLMClient from request state.
-# ---------------------------------------------------------------------------
-
-
-_default_client: LLMClient | None = None
-
-
-def get_default_client() -> LLMClient:
-    global _default_client
-    if _default_client is None:
-        _default_client = LLMClient()
-    return _default_client
-
-
-def reset_default_client() -> None:
-    """For tests."""
-    global _default_client
-    _default_client = None
+__all__ = ["DEFAULT_BASE_URL", "DEFAULT_MODEL", "LLMClient"]

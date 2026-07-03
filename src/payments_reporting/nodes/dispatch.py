@@ -1,7 +1,7 @@
-"""dispatch_emails node: send per-partner HTML emails.
+"""dispatch_emails: send per-partner HTML emails.
 
-Input:  email_bodies, partner_summaries, run_id, out_dir
-Output: send_results: list[SendResult]
+Reads email_bodies, partner_summaries, run_id, out_dir. Writes
+send_results: list[SendResult].
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ async def dispatch_emails(state: GraphState) -> dict:
         summary = summaries.get(pid)
         if summary is None:
             continue
-        result: SendResult = await sender.send(
+        result = await sender.send(
             to_email=summary.contact_email,
             subject=body.subject,
             html_body=body.html_body,
@@ -37,9 +37,7 @@ async def dispatch_emails(state: GraphState) -> dict:
         results.append(result)
 
     failures = [r for r in results if not r.success]
-    log.info(
-        "dispatch.done sent=%d failed=%d", len(results), len(failures)
-    )
+    log.info("dispatch.done sent=%d failed=%d", len(results), len(failures))
     return {"send_results": results}
 
 

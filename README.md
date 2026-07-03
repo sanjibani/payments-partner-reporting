@@ -5,31 +5,37 @@ Application Insights, aggregates per-partner per-gateway, fans out one
 `Send` per partner through LLM analysis + chart rendering + email
 composition in parallel, and ships an HTML email to each partner.
 
+The full design contract lives in [`plan.md`](./plan.md). Read that
+first. This README is the public-facing summary.
+
 ## Architecture in one paragraph
 
 A weekly trigger (cron / Logic App) hits `POST /run-weekly` on a FastAPI
-service. The service runs a LangGraph `StateGraph` with five main
+service. The service runs a LangGraph `StateGraph` with six main-graph
 nodes (`trigger -> ingest -> aggregate -> partner_pipeline ->
-dispatch_emails`) plus one terminal alert node. After `aggregate`, a
-conditional edge returns one `Send` per partner, dispatching the
-`partner_pipeline` node in parallel. Only the partner-pipeline's
-`analyze` and `email` sub-steps touch MiniMax; everything else is
-deterministic Python with graceful degradation. The container deploys
-to Azure Container Apps with `minReplica=0` so cost outside the weekly
-window is effectively zero.
+dispatch_emails`, plus the terminal `alert_failure`). After `aggregate`,
+a conditional edge returns one `Send` per partner, dispatching the
+`partner_pipeline` node in parallel via the Send API. Only the
+`analyze` and `email` sub-steps of `partner_pipeline` touch MiniMax;
+everything else is deterministic Python with graceful fallback
+templates. The container deploys to Azure Container Apps with
+`minReplica=0` so cost outside the weekly window is effectively zero.
 
 ## LangGraph features actually used
 
-- `StateGraph` with a typed `GraphState` (TypedDict)
+Six real LangGraph features, all in `src/payments_reporting/graph.py`:
+
+- `StateGraph(GraphState)` with typed `TypedDict`
 - `add_node` and `add_edge` for the linear skeleton
-- `add_conditional_edges` with three routing functions
-  - `route_after_ingest` -- skip to `END` if no data
+- `add_conditional_edges` with three routing functions:
+  - `route_after_ingest` -- skip to END if no data
   - `fan_out_partners` -- return `list[Send]` for parallel fan-out
   - `route_after_dispatch` -- route dispatch failures to `alert_failure`
 - `Send` API from `langgraph.types` -- one invocation per partner, parallel
+- `Annotated[dict, merge_dicts]` reducer on three partner-keyed fields
+  for concurrent-write safety
 - `MemorySaver` checkpointer -- `thread_id` per run, replayable
 - `graph.astream()` for live node-level event streaming
-- `Annotated[dict, reducer]` on partner-keyed fields for concurrent write safety
 
 ## Local quickstart (no Azure, no spend)
 
@@ -53,16 +59,20 @@ python scripts/run_local.py
 
 # 5. start the FastAPI service
 python scripts/run_local.py --serve
+
+# 6. run the test suite
+PYTHONPATH=src:. pytest tests/
 ```
 
-The output is written to `out/<run-id>/`:
+Output is written to `out/<run-id>/`:
 - `state.json` -- full graph state after each node (interview gold)
 - `partners/<id>/email.html` -- final email body per partner
 - `partners/<id>/charts/*.png` -- chart images
 
-## Inputs/outputs of every node
+## Per-node I/O contract
 
-### Main graph (6 nodes, 1 conditional terminal)
+The state contract. The code must match this table. If you change a
+node's writes, update this table and `plan.md` in the same commit.
 
 | Node                | Reads from state                                          | Writes to state                              |
 |---------------------|-----------------------------------------------------------|----------------------------------------------|
@@ -70,16 +80,17 @@ The output is written to `out/<run-id>/`:
 | `ingest`            | `week_start`, `week_end`, `partners`                      | `raw_metrics`, `last_week_metrics`           |
 | `aggregate`         | `raw_metrics`, `last_week_metrics`, partners              | `partner_summaries` (DTO per partner)        |
 | `partner_pipeline`  | dispatched via `Send` once per partner (parallel)         | `analyses[pid]`, `charts[pid]`, `email_bodies[pid]` |
-| `dispatch_emails`   | `email_bodies`, partner contact, `run_id`, `out_dir`      | `send_results` (list of `SendResult`)        |
-| `alert_failure`     | `send_results` (failures only)                            | `errors` (append failed dispatch details)    |
+| `dispatch_emails`   | `email_bodies`, summaries, `run_id`, `out_dir`           | `send_results` (list of `SendResult`)        |
+| `alert_failure`     | `send_results` (failures only)                            | `errors` (appended)                          |
 
-### Per-partner sub-pipeline (called in parallel via Send)
+### Conditional edges
 
-| Sub-step            | Input                                            | Output                       |
-|---------------------|--------------------------------------------------|------------------------------|
-| `analyze`           | `PartnerSummary` (LLM)                           | `analyses[pid]`              |
-| `chart`             | `PartnerSummary`, `analyses[pid]`                | `charts[pid]` (3 PNGs)       |
-| `email`             | `PartnerSummary`, `analyses[pid]`, `charts[pid]` | `email_bodies[pid]` (LLM)    |
+- After `ingest`: if `state.raw_metrics` is empty, route to `END`.
+  Otherwise route to `aggregate`.
+- After `aggregate`: conditional edge returns `list[Send]` -- one per
+  partner. If empty, returns `[]` and LangGraph routes to END.
+- After `dispatch_emails`: if any send failed, route to `alert_failure`.
+  Otherwise `END`.
 
 ## Why LangGraph, why LLM
 
@@ -115,29 +126,56 @@ compute cost is zero.
 
 ```
 src/payments_reporting/
-  state.py              # TypedDict GraphState + PartnerPipelineState + Pydantic DTOs
-  graph.py              # StateGraph wiring, conditional edges, Send fan-out
-  partner_pipeline.py   # Per-partner pipeline node + module-level context
-  llm.py                # MiniMax client + graceful degradation
-  prompts/__init__.py   # analysis + email prompt templates
+  __init__.py             # __version__
+  py.typed                # marker for downstream mypy
+  state.py                # DTOs + TypedDicts + reducers + snapshot helper
+  graph.py                # StateGraph wiring + run/stream/checkpoint entrypoints
+  partner_pipeline.py     # per-partner analyze -> chart -> email + module ctx
+  llm.py                  # MiniMax client + graceful degradation
+  prompts/__init__.py     # analysis + email prompt templates
   tools/
-    app_insights.py     # KQL client (real mode) + CSV fallback (dev mode)
-    email_sender.py     # SMTP / dry-run
+    __init__.py
+    app_insights.py       # KQL client (real mode) + CSV fallback (dev mode)
+    email_sender.py       # SMTP / dry-run
   nodes/
-    _timing.py          # Node timing + error wrapper
-    trigger.py          # resolve week_start, week_end, partners
-    ingest.py           # fetch raw_metrics via App Insights or CSV
-    aggregate.py        # build per-partner summaries + anomaly detection
-    analysis.py         # analyze_one + fallback_analysis (LLM helper)
-    charts.py           # render_partner_charts (matplotlib, no LLM)
-    email.py            # compose_one + fallback_email (LLM helper)
-    dispatch.py         # send via SMTP / dry-run
+    __init__.py           # re-exports main-graph nodes only
+    _timing.py            # run_node wrapper for main-graph nodes
+    trigger.py            # main-graph node
+    ingest.py             # main-graph node
+    aggregate.py          # main-graph node + summary builders (tested directly)
+    analysis.py           # analyze_one + fallback_analysis helpers
+    charts.py             # chart helpers + render_partner_charts
+    email.py              # compose_one + fallback_email helpers
+    dispatch.py           # main-graph node
 
-api/main.py             # FastAPI service: POST /run-weekly, /stream, /runs, /threads
-scripts/run_local.py    # CLI runner with --stream, --serve, --dry-run flags
-data/sample_week.csv    # sample 1-week telemetry (3 partners, seeded Braintree anomaly)
-tests/                  # smoke tests covering graph, fan-out, checkpoint, streaming
-azure/                  # Container App bicep + Logic App JSON
+api/
+  __init__.py
+  main.py                 # FastAPI: /run-weekly, /run-weekly/stream, /runs, /threads
+
+scripts/
+  __init__.py
+  run_local.py            # CLI: --seed --dry-run --partner --stream --serve
+  seed_sample.py          # generates data/sample_week.csv with seeded anomaly
+
+tests/
+  __init__.py
+  test_smoke.py           # 16 smoke tests covering every LangGraph feature
+
+data/
+  sample_week.csv         # generated by seed_sample.py
+
+azure/
+  main.bicep              # Container Apps + ACR + Log Analytics
+  logic-app-workflow.json # weekly trigger
+
+plan.md                   # source-of-truth spec
+README.md                 # this file
+INTERVIEW_PREP.md         # interview Q&A
+SPEC.md                   # problem / outcome / non-goals
+.env.example
+.gitignore
+Dockerfile
+pyproject.toml
 ```
 
 ## Cost reality check
@@ -156,3 +194,18 @@ azure/                  # Container App bicep + Logic App JSON
 - Short sentences. No "I dug into this."
 - Name the document / metric before the partner.
 - Same rules as the OSS PR push stream. Same anti-pattern set.
+
+## Anti-patterns the test suite enforces
+
+These were the bugs in the first pass. `tests/test_smoke.py` will
+catch them if they ever come back:
+
+1. **No duplicate edges** from the same source. Either
+   `add_edge` OR `add_conditional_edges`, never both.
+2. **No missing reducers** on partner-keyed fields. Without
+   `Annotated[dict, merge_dicts]`, parallel Send branches raise
+   `INVALID_CONCURRENT_GRAPH_UPDATE`.
+3. **No overlap** between `PartnerPipelineState` and `GraphState`.
+   Read-only metadata goes through `_PIPELINE_CTX`, never the subgraph
+   state.
+4. **No em-dashes** anywhere in `src/`, `api/`, `scripts/`.

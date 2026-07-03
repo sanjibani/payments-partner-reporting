@@ -1,13 +1,13 @@
 """FastAPI service for the weekly payments reporting workflow.
 
 Endpoints:
-- POST /run-weekly       -- kicks off the full LangGraph batch
+- POST /run-weekly       -- runs the full LangGraph batch (one-shot)
 - POST /run-weekly/stream -- streams node-level events as SSE
+- GET  /runs/{run_id}    -- JSON snapshot of a previous run
+- GET  /threads/{tid}    -- checkpoint state for a thread
 - GET  /healthz          -- liveness probe
-- GET  /runs/{run_id}    -- JSON snapshot of the last run's final state
-- GET  /threads/{tid}    -- checkpoint state for a thread (replay / debug)
 
-In Azure Container Apps this is the HTTP target the Logic App / cron
+In Azure Container Apps this is the HTTP target the Logic App weekly
 trigger hits every Monday 06:00 UTC.
 """
 
@@ -35,12 +35,11 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Payments Partner Reporting",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Weekly LangGraph workflow that ships partner-specific payments "
-        "analytics via email. Triggered by POST /run-weekly. Uses Send "
-        "API for parallel per-partner fan-out and MemorySaver for "
-        "checkpointing."
+        "analytics via email. Uses Send API for parallel per-partner "
+        "fan-out and MemorySaver for checkpointing."
     ),
 )
 
@@ -48,16 +47,15 @@ app = FastAPI(
 class RunWeeklyRequest(BaseModel):
     dry_run: bool = Field(
         default=False,
-        description="If true, skip LLM calls and SMTP send. Charts and email HTML still produced.",
+        description="If true, skip LLM calls and SMTP send.",
     )
     out_dir: str | None = Field(
         default=None,
-        description="Override the output directory. Defaults to out/<run_id>/.",
+        description="Override the output directory.",
     )
     thread_id: str | None = Field(
         default=None,
-        description="Optional checkpoint thread id. If omitted, run_id is used. "
-        "Allows replay / inspection after the run finishes.",
+        description="Checkpoint thread id. Defaults to run_id.",
     )
 
 
@@ -71,9 +69,6 @@ class RunWeeklyResponse(BaseModel):
     errors: list[str]
     state_json: str
     out_dir: str
-
-
-_RECENT: dict[str, RunWeeklyResponse] = {}
 
 
 @app.get("/healthz")
@@ -103,12 +98,11 @@ async def run_weekly_endpoint(req: RunWeeklyRequest) -> RunWeeklyResponse:
             out_dir=out_dir,
             thread_id=thread_id,
         )
-    except Exception as e:  # noqa: BLE001 -- top-level safety net
+    except Exception as e:  # noqa: BLE001
         log.exception("run-weekly.crash run_id=%s", run_id)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     finished = datetime.now(timezone.utc)
-
     send_results = final.get("send_results") or []
     emails_sent = sum(1 for r in send_results if r.success)
 
@@ -123,7 +117,6 @@ async def run_weekly_endpoint(req: RunWeeklyRequest) -> RunWeeklyResponse:
         state_json=dump_state_json(final),
         out_dir=out_dir,
     )
-    _RECENT[run_id] = response
 
     Path(out_dir, "state.json").write_text(response.state_json, encoding="utf-8")
 
@@ -138,11 +131,7 @@ async def run_weekly_endpoint(req: RunWeeklyRequest) -> RunWeeklyResponse:
 
 @app.post("/run-weekly/stream")
 async def run_weekly_stream(req: RunWeeklyRequest) -> StreamingResponse:
-    """Stream node-level events as Server-Sent Events.
-
-    Useful for live monitoring. Each SSE message is one node firing,
-    with its partial state keys visible.
-    """
+    """Stream node-level events as Server-Sent Events."""
     run_id = uuid.uuid4().hex[:12]
     thread_id = req.thread_id or run_id
     out_dir = req.out_dir or f"out/{run_id}"
@@ -167,10 +156,7 @@ async def get_run(run_id: str) -> dict[str, Any]:
     """Return the JSON snapshot of a previous run from disk."""
     state_path = Path(f"out/{run_id}/state.json")
     if not state_path.exists():
-        cached = _RECENT.get(run_id)
-        if cached is None:
-            raise HTTPException(status_code=404, detail=f"run {run_id} not found")
-        return cached.model_dump(mode="json")
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found")
     return json.loads(state_path.read_text(encoding="utf-8"))
 
 

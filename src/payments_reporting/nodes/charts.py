@@ -2,7 +2,7 @@
 
 The graph node (`partner_chart`) lives in `partner_pipeline.py`. This
 module exposes the chart-rendering helpers that the subgraph node
-uses.
+uses. No LLM. matplotlib only.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")  # headless
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from ..state import ChartFile, PartnerSummary
@@ -121,7 +121,7 @@ def wow_trend(summary: PartnerSummary, out_path: Path) -> ChartFile:
 def render_partner_charts(
     summary: PartnerSummary, out_dir: Path
 ) -> list[ChartFile]:
-    """Render all three charts for a partner to out_dir/charts/."""
+    """Render all three charts for a partner into out_dir/charts/."""
     charts_dir = out_dir / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
     return [

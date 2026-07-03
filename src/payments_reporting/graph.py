@@ -1,7 +1,6 @@
-"""LangGraph StateGraph wiring with Send API, conditional edges,
-checkpointing, and streaming support.
+"""LangGraph StateGraph wiring.
 
-Graph topology:
+Graph topology (see plan.md section 2 for the ASCII diagram):
 
     trigger
       |
@@ -12,28 +11,30 @@ Graph topology:
     aggregate
       |
       v   (conditional edge -> Send fan-out, one branch per partner)
-    partner_pipeline (compiled subgraph, runs N times in parallel)
-      |              analyze -> chart -> email per partner
+    partner_pipeline (parallel; runs N times)
+      |
       v
-    dispatch_emails  -----> [send failures] -> alert_failure -> END
+    dispatch_emails -----> [failures] -> alert_failure -> END
       |
       v
     END
 
-LangGraph features actually used here:
-- StateGraph with a TypedDict schema
-- add_node / add_edge for linear nodes
-- add_conditional_edges with a routing function for branching
-- Send API for parallel per-partner fan-out (the partner_pipeline
-  subgraph runs once per partner in parallel; partial returns merge
-  into the main state keyed by partner_id)
-- Compiled subgraph embedded as a node (partner_pipeline = build_partner_subgraph())
-- MemorySaver checkpointer for replay/debug (thread_id per run)
-- graph.stream() for live node-level events
+LangGraph features used here (see plan.md section 3):
+- StateGraph with a typed GraphState
+- add_node / add_edge for the linear skeleton
+- add_conditional_edges with three routing functions:
+  - route_after_ingest  -- skip to END on empty
+  - fan_out_partners    -- Send API parallel fan-out
+  - route_after_dispatch -- alert_failure on send failures
+- Send API from langgraph.types -- parallel per-partner dispatch
+- Annotated[..., merge_dicts] reducer on partner-keyed fields
+- MemorySaver checkpointer -- thread_id per run, replayable
+- graph.astream() for live node-level event streaming
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Literal
 
@@ -61,7 +62,7 @@ def route_after_ingest(state: GraphState) -> Literal["aggregate", END]:
     """If ingest produced no rows, skip to END. Otherwise aggregate."""
     raw = state.get("raw_metrics") or {}
     if not raw:
-        log.warning("route.after_ingest.empty no_partners=%s", list(raw.keys()))
+        log.warning("route.after_ingest.empty keys=%s", list(raw.keys()))
         return END
     return "aggregate"
 
@@ -69,21 +70,20 @@ def route_after_ingest(state: GraphState) -> Literal["aggregate", END]:
 def fan_out_partners(state: GraphState) -> list[Send]:
     """Conditional edge: dispatch one Send per partner to the subgraph.
 
-    This is the marquee LangGraph pattern. After aggregate, we do not
-    know how many partners we have. A linear edge would force us to
-    bake that in at compile time. Instead, this function inspects the
-    state at runtime and returns one Send per partner. LangGraph runs
-    them in parallel and merges the partials back into GraphState.
-
-    The Send state only carries partner_id + summary. Read-only
-    metadata (run_id, dry_run, out_dir) is pushed into a module-level
-    context the subgraph nodes read at invocation time. This avoids
-    LangGraph's INVALID_CONCURRENT_GRAPH_UPDATE error when multiple
-    branches try to write overlapping keys back into the parent state.
+    The marquee LangGraph pattern. After aggregate, we do not know
+    how many partners we have -- a linear edge would force us to bake
+    that in at compile time. This function inspects the state at
+    runtime and returns one Send per partner. LangGraph runs them in
+    parallel and merges the partials back into GraphState keyed by
+    partner_id (via the merge_dicts reducer on analyses / charts /
+    email_bodies).
     """
     summaries = state.get("partner_summaries") or {}
     out_dir = state.get("out_dir") or f"out/{state['run_id']}"
 
+    # Push read-only metadata into the module-level context. Do NOT
+    # put these in PartnerPipelineState -- that causes concurrent
+    # write conflicts on fan-back (see plan.md risk register #3).
     set_pipeline_ctx(
         run_id=state["run_id"],
         dry_run=bool(state.get("dry_run")),
@@ -101,7 +101,9 @@ def fan_out_partners(state: GraphState) -> list[Send]:
     return sends
 
 
-def route_after_dispatch(state: GraphState) -> Literal["alert_failure", END]:
+def route_after_dispatch(
+    state: GraphState,
+) -> Literal["alert_failure", END]:
     """If any send failed, route to alert_failure. Otherwise END."""
     results = state.get("send_results") or []
     failed = [r for r in results if not getattr(r, "success", False)]
@@ -111,31 +113,32 @@ def route_after_dispatch(state: GraphState) -> Literal["alert_failure", END]:
     return END
 
 
-async def alert_failure(state: GraphState) -> dict[str, Any]:
-    """Terminal alert node. In production this would page on-call.
+# ---------------------------------------------------------------------------
+# Terminal alert node
+# ---------------------------------------------------------------------------
 
-    In this build it appends a structured error record to state.errors
-    so the run's audit trail captures the dispatch failure.
-    """
+
+async def alert_failure(state: GraphState) -> dict[str, Any]:
+    """Terminal alert. Appends dispatch failures to state.errors."""
     failed = [
         r for r in (state.get("send_results") or [])
         if not getattr(r, "success", False)
     ]
     errs = list(state.get("errors") or [])
     for r in failed:
-        errs.append(
-            f"dispatch_failed partner={r.partner_id} error={r.error}"
-        )
+        errs.append(f"dispatch_failed partner={r.partner_id} error={r.error}")
     log.error("alert_failure dispatched=%d", len(failed))
     return {"errors": errs}
 
 
 # ---------------------------------------------------------------------------
-# Wrapper for main-graph nodes (timing + error capture)
+# Node wrapper
 # ---------------------------------------------------------------------------
 
 
 def _wrap(name: str, fn):  # type: ignore[no-untyped-def]
+    """Wrap a main-graph node with timing + error capture."""
+
     async def wrapped(state: GraphState) -> dict[str, Any]:
         return await run_node(state, name, fn)
 
@@ -148,39 +151,40 @@ def _wrap(name: str, fn):  # type: ignore[no-untyped-def]
 
 
 def build_graph(checkpointer: MemorySaver | None = None):
-    """Compile the main graph. Optional checkpointer for replay/debug."""
+    """Compile the main graph. Optional checkpointer for replay/debug.
+
+    CRITICAL: there must be exactly ONE edge declaration per source
+    node. Either add_edge OR add_conditional_edges, never both.
+    See plan.md risk register #1.
+    """
     g = StateGraph(GraphState)
 
-    # Linear nodes
+    # Main-graph nodes (wrapped for timing + error capture)
     g.add_node("trigger", _wrap("trigger", trigger))
     g.add_node("ingest", _wrap("ingest", ingest))
     g.add_node("aggregate", _wrap("aggregate", aggregate))
     g.add_node("dispatch_emails", _wrap("dispatch_emails", dispatch_emails))
     g.add_node("alert_failure", _wrap("alert_failure", alert_failure))
 
-    # Per-partner pipeline node. LangGraph dispatches this once per
-    # Send invocation, in parallel. Each invocation runs the full
-    # analyze -> chart -> email sequence for one partner.
+    # Per-partner pipeline node -- dispatched via Send, in parallel
     g.add_node("partner_pipeline", partner_pipeline_node)
 
     # Wiring
     g.set_entry_point("trigger")
     g.add_edge("trigger", "ingest")
 
-    # Conditional edge after ingest: skip to END if no data.
+    # Conditional edge after ingest: skip to END if no data
     g.add_conditional_edges(
         "ingest",
         route_after_ingest,
         {"aggregate": "aggregate", END: END},
     )
 
-    # Conditional edge after aggregate: fan out one branch per partner
-    # via the Send API. LangGraph runs the partner_pipeline node once
-    # per Send, in parallel. The partner_pipeline node then runs the
-    # full analyze -> chart -> email sequence for that partner.
+    # Conditional edge after aggregate: Send fan-out, one per partner.
+    # NO add_edge from aggregate -- that would override the conditional.
     g.add_conditional_edges("aggregate", fan_out_partners)
 
-    # All parallel branches converge at dispatch_emails.
+    # Fan-in: all parallel branches converge at dispatch_emails.
     g.add_edge("partner_pipeline", "dispatch_emails")
 
     # Conditional edge after dispatch: route failures to alert_failure.
@@ -196,7 +200,7 @@ def build_graph(checkpointer: MemorySaver | None = None):
 
 
 # ---------------------------------------------------------------------------
-# Cached compiled graph + thread_id helper
+# Cached compiled graphs
 # ---------------------------------------------------------------------------
 
 
@@ -207,8 +211,8 @@ _compiled_no_checkpoint = None
 def get_graph(with_checkpoint: bool = True):
     """Cached compiled graph.
 
-    with_checkpoint=True: includes a MemorySaver so each run gets a
-    thread_id and the run can be inspected / resumed after the fact.
+    with_checkpoint=True includes MemorySaver so each run gets a
+    thread_id and can be inspected / resumed after the fact.
     """
     global _compiled_with_checkpoint, _compiled_no_checkpoint
     if with_checkpoint:
@@ -251,8 +255,7 @@ async def stream_weekly(
 ):
     """Yield node-level events as the graph runs.
 
-    Yields tuples of (node_name, partial_state_dict). Useful for live
-    observability in the CLI or for SSE in the FastAPI service.
+    Each event is dict[node_name, partial_state].
     """
     state = initial_state(run_id=run_id, dry_run=dry_run)
     if out_dir:
@@ -260,7 +263,6 @@ async def stream_weekly(
     graph = get_graph(with_checkpoint=True)
     config = {"configurable": {"thread_id": thread_id or run_id}}
     async for event in graph.astream(state, config=config):
-        # event is dict[node_name, partial_state]
         yield event
 
 
@@ -275,12 +277,11 @@ def get_checkpoint_state(thread_id: str) -> dict[str, Any] | None:
 
 
 def dump_state_json(state: GraphState) -> str:
-    import json
-
     return json.dumps(state_snapshot(state), indent=2, default=str)
 
 
 __all__ = [
+    "alert_failure",
     "build_graph",
     "dump_state_json",
     "fan_out_partners",

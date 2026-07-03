@@ -1,11 +1,7 @@
 """ingest_node: fetch raw metrics for the week.
 
-Input:  week_start, week_end, partners
-Output: raw_metrics: dict[partner_id, list[RawRow]]
-        last_week_metrics: dict[partner_id, list[RawRow]]  (for WoW trends)
-
-In production this hits App Insights KQL via tools.app_insights.
-Locally it reads a CSV so the whole pipeline is runnable without Azure.
+Reads week_start, week_end, partners. Writes raw_metrics and
+last_week_metrics (for week-over-week trends).
 """
 
 from __future__ import annotations
@@ -32,9 +28,11 @@ async def ingest(state: GraphState) -> dict:
     week_start = state["week_start"]
     week_end = state["week_end"]
     partners = state["partners"]
-    csv_path_env = state.get("dry_run") and "data/sample_week.csv" or None
-    csv_path = Path(csv_path_env) if csv_path_env else None
 
+    # Use CSV fallback when dry_run, otherwise attempt real KQL.
+    csv_path = (
+        Path("data/sample_week.csv") if state.get("dry_run") else None
+    )
     client = AppInsightsClient(csv_path=csv_path)
     try:
         rows = await client.fetch_rows(
@@ -50,10 +48,8 @@ async def ingest(state: GraphState) -> dict:
 
     raw = _group_by_partner(rows)
     last_week = _group_by_partner(last_week_rows)
-
-    log.info(
-        "ingest.done rows=%d partners=%d",
-        len(rows),
-        len(raw),
-    )
+    log.info("ingest.done rows=%d partners=%d", len(rows), len(raw))
     return {"raw_metrics": raw, "last_week_metrics": last_week}
+
+
+__all__ = ["ingest"]

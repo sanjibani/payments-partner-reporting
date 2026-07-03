@@ -1,9 +1,8 @@
 """Helpers for the analysis LLM call.
 
-The actual graph node (`partner_analyze`) lives in `partner_pipeline.py`
-where the per-partner subgraph is wired. This module exposes the
-deterministic fallback and the per-partner LLM helper that the
-subgraph node uses.
+The graph node (`partner_analyze`) lives in `partner_pipeline.py`. This
+module exposes the deterministic fallback and the per-partner LLM
+helper that the subgraph node uses.
 """
 
 from __future__ import annotations
@@ -40,9 +39,11 @@ def fallback_analysis(summary: PartnerSummary) -> AnalysisOutput:
     return AnalysisOutput(
         overview=summary.headline,
         key_issues=issues,
-        likely_causes=[
-            "Pattern matches gateway timeout / decline codes",
-        ] if top else ["No anomalies detected"],
+        likely_causes=(
+            ["Pattern matches gateway timeout / decline codes"]
+            if top
+            else ["No anomalies detected"]
+        ),
         recommended_actions=actions,
     )
 

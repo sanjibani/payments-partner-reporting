@@ -1,11 +1,7 @@
 """aggregate_node: build per-partner PartnerSummary from raw metrics.
 
-Input:  raw_metrics, last_week_metrics, partners, week_start, week_end
-Output: partner_summaries: dict[partner_id, PartnerSummary]
-
-Pure deterministic code. The LLM never sees raw rows, only these
-structured DTOs  --  that's why the cost is bounded and the output is
-grounded.
+Pure deterministic Python. Reads raw_metrics, last_week_metrics,
+partners. Writes partner_summaries.
 """
 
 from __future__ import annotations
@@ -26,17 +22,12 @@ from ..state import (
 
 log = logging.getLogger(__name__)
 
-ANOMALY_THRESHOLD_PCT = 25.0
+ANOMALY_LATENCY_THRESHOLD_PCT = 25.0
+ANOMALY_SUCCESS_RATE_THRESHOLD = 0.05
 
 
-def _by_partner(rows: list[RawRow]) -> dict[str, list[RawRow]]:
-    out: dict[str, list[RawRow]] = {}
-    for r in rows:
-        out.setdefault(r.partner_id, []).append(r)
-    return out
-
-
-def _gateway_stats(rows: list[RawRow]) -> list[GatewayStat]:
+def gateway_stats(rows: list[RawRow]) -> list[GatewayStat]:
+    """Per-gateway aggregate from a list of rows."""
     by_gw: dict[str, list[RawRow]] = {}
     for r in rows:
         by_gw.setdefault(r.gateway, []).append(r)
@@ -60,7 +51,7 @@ def _gateway_stats(rows: list[RawRow]) -> list[GatewayStat]:
     return out
 
 
-def _top_failures(rows: list[RawRow], n: int = 5) -> list[FailureBucket]:
+def top_failures(rows: list[RawRow], n: int = 5) -> list[FailureBucket]:
     counter: Counter[tuple[str, str]] = Counter()
     for r in rows:
         if not r.success:
@@ -71,54 +62,47 @@ def _top_failures(rows: list[RawRow], n: int = 5) -> list[FailureBucket]:
     ]
 
 
-def _trends(
+def trends(
     this_rows: list[RawRow], last_rows: list[RawRow]
 ) -> list[TrendDelta]:
     """Compare this-week vs last-week on a few headline metrics."""
-    last_by_gw = _gateway_stats(last_rows)
-
-    def _metric(gw_rows: list[RawRow]) -> tuple[float, float]:
-        total = len(gw_rows)
-        succ = sum(1 for r in gw_rows if r.success)
-        rate = succ / total if total else 0.0
-        avg_lat = mean(r.latency_ms for r in gw_rows) if gw_rows else 0.0
-        return rate, avg_lat
-
+    last_by_gw = gateway_stats(last_rows)
     out: list[TrendDelta] = []
-    for gw_stat in _gateway_stats(this_rows):
+    for gw_stat in gateway_stats(this_rows):
         gw_rows = [r for r in this_rows if r.gateway == gw_stat.gateway]
-        rate_now, lat_now = _metric(gw_rows)
-        match = next((g for g in last_by_gw if g.gateway == gw_stat.gateway), None)
+        match = next(
+            (g for g in last_by_gw if g.gateway == gw_stat.gateway), None
+        )
         if match is None:
             continue
-        _, lat_last = _metric([r for r in last_rows if r.gateway == gw_stat.gateway])
-        delta_pct = (
-            ((lat_now - lat_last) / lat_last * 100.0) if lat_last else 0.0
+        this_lat = mean(r.latency_ms for r in gw_rows) if gw_rows else 0.0
+        last_lat = match.avg_latency_ms
+        lat_delta = (
+            ((this_lat - last_lat) / last_lat * 100.0) if last_lat else 0.0
         )
         out.append(
             TrendDelta(
                 metric=f"{gw_stat.gateway}_avg_latency_ms",
-                this_week=round(lat_now, 1),
-                last_week=round(lat_last, 1),
-                delta_pct=round(delta_pct, 1),
-                is_anomaly=abs(delta_pct) > ANOMALY_THRESHOLD_PCT,
+                this_week=round(this_lat, 1),
+                last_week=round(last_lat, 1),
+                delta_pct=round(lat_delta, 1),
+                is_anomaly=abs(lat_delta) > ANOMALY_LATENCY_THRESHOLD_PCT,
             )
         )
+        sr_delta = gw_stat.success_rate - match.success_rate
         out.append(
             TrendDelta(
                 metric=f"{gw_stat.gateway}_success_rate",
-                this_week=round(rate_now * 100, 2),
+                this_week=round(gw_stat.success_rate * 100, 2),
                 last_week=round(match.success_rate * 100, 2),
-                delta_pct=round(
-                    (rate_now - match.success_rate) * 100, 1
-                ),
-                is_anomaly=abs(rate_now - match.success_rate) > 0.05,
+                delta_pct=round(sr_delta * 100, 1),
+                is_anomaly=abs(sr_delta) > ANOMALY_SUCCESS_RATE_THRESHOLD,
             )
         )
     return out
 
 
-def _build_summary(
+def build_summary(
     meta: PartnerMeta,
     rows: list[RawRow],
     last_rows: list[RawRow],
@@ -136,9 +120,9 @@ def _build_summary(
         week_end=week_end,
         total_requests=total,
         overall_success_rate=round(overall_rate, 4),
-        by_gateway=_gateway_stats(rows),
-        top_failures=_top_failures(rows),
-        trends=_trends(rows, last_rows),
+        by_gateway=gateway_stats(rows),
+        top_failures=top_failures(rows),
+        trends=trends(rows, last_rows),
     )
 
 
@@ -153,9 +137,11 @@ async def aggregate(state: GraphState) -> dict:
     for pid, meta in by_meta.items():
         rows = raw.get(pid, [])
         last_rows = last.get(pid, [])
-        summaries[pid] = _build_summary(
+        summaries[pid] = build_summary(
             meta, rows, last_rows, week_start, week_end
         )
-
     log.info("aggregate.done summaries=%d", len(summaries))
     return {"partner_summaries": summaries}
+
+
+__all__ = ["aggregate", "build_summary", "gateway_stats", "top_failures", "trends"]

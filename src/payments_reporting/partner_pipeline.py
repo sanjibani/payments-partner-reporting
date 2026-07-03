@@ -12,7 +12,19 @@ When you embed a compiled LangGraph subgraph as a node and dispatch
 it via Send, the Send dict sometimes does not propagate cleanly into
 the subgraph's initial state (we hit a KeyError on `partner_id` in
 testing). A single node function avoids that machinery while keeping
-all the parallel-fan-out behavior we want.
+all the parallel-fan-out behaviour we want.
+
+Why a module-level context for run_id / dry_run / out_dir?
+
+When a Send branch finishes, LangGraph merges the subgraph's final
+state back into the parent graph's state. If PartnerPipelineState
+shared any key with GraphState (e.g. run_id, dry_run, out_dir),
+every parallel branch would attempt to write that key back, and the
+LastValue channel would raise `INVALID_CONCURRENT_GRAPH_UPDATE`.
+The fix is to keep those fields OUT of PartnerPipelineState and pass
+them via a module-level dict that the subgraph nodes read at
+invocation time. The parent graph sets the context inside
+`fan_out_partners` immediately before returning the list of Sends.
 """
 
 from __future__ import annotations
@@ -23,13 +35,11 @@ from pathlib import Path
 from typing import Any
 
 from .llm import LLMClient
-from .nodes.analysis import analyze_one, fallback_analysis
+from .nodes.analysis import analyze_one
 from .nodes.charts import render_partner_charts
-from .nodes.email import compose_one, fallback_email
+from .nodes.email import compose_one
 from .prompts import EMAIL_SYSTEM, email_user_prompt
 from .state import (
-    AnalysisOutput,
-    ChartFile,
     EmailOutput,
     PartnerMeta,
     PartnerPipelineState,
@@ -41,8 +51,7 @@ log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Module-level context. Read-only metadata for the subgraph that must NOT
-# overlap with GraphState keys (otherwise the Send fan-back causes
-# LangGraph's INVALID_CONCURRENT_GRAPH_UPDATE).
+# overlap with GraphState keys.
 # ---------------------------------------------------------------------------
 
 
@@ -53,7 +62,9 @@ _PIPELINE_CTX: dict[str, Any] = {
 }
 
 
-def set_pipeline_ctx(*, run_id: str, dry_run: bool, out_dir: str) -> None:
+def set_pipeline_ctx(
+    *, run_id: str, dry_run: bool, out_dir: str
+) -> None:
     """Called by fan_out_partners immediately before dispatching Sends."""
     global _PIPELINE_CTX
     _PIPELINE_CTX = {
@@ -68,7 +79,7 @@ def get_pipeline_ctx() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# The actual per-partner pipeline node
+# The per-partner pipeline node
 # ---------------------------------------------------------------------------
 
 
@@ -84,7 +95,6 @@ async def partner_pipeline_node(
     pid = state["partner_id"]
     summary: PartnerSummary = state["summary"]
     ctx = get_pipeline_ctx()
-
     llm = LLMClient(disabled=bool(ctx.get("dry_run")))
 
     # 1. analyze (LLM #1)
@@ -119,8 +129,6 @@ async def partner_pipeline_node(
         contact_email=summary.contact_email,
     )
     try:
-        from .prompts import EMAIL_SYSTEM, email_user_prompt
-
         data = llm.complete_json(
             EMAIL_SYSTEM,
             email_user_prompt(
@@ -133,6 +141,8 @@ async def partner_pipeline_node(
         email = EmailOutput.model_validate(data)
     except Exception as e:  # noqa: BLE001
         log.warning("partner_pipeline.email.fallback partner=%s %s", pid, e)
+        from .nodes.email import fallback_email
+
         email = fallback_email(summary, analysis)
     log.debug(
         "partner_pipeline.email partner=%s elapsed_ms=%.2f",
@@ -140,8 +150,8 @@ async def partner_pipeline_node(
         (time.perf_counter() - t0) * 1000,
     )
 
-    # Return partials keyed by partner_id so LangGraph merges them
-    # correctly when fan-in happens.
+    # Return partials keyed by partner_id so the merge_dicts reducer
+    # accumulates them correctly across concurrent fan-out branches.
     return {
         "analyses": {pid: analysis},
         "charts": {pid: chart_list},
@@ -149,85 +159,8 @@ async def partner_pipeline_node(
     }
 
 
-# ---------------------------------------------------------------------------
-# Convenience exports for callers that want to introspect or test
-# individual sub-steps without going through the full pipeline.
-# ---------------------------------------------------------------------------
-
-
-async def partner_analyze(state: PartnerPipelineState) -> dict[str, Any]:
-    pid = state["partner_id"]
-    summary = state["summary"]
-    ctx = get_pipeline_ctx()
-    llm = LLMClient(disabled=bool(ctx.get("dry_run")))
-    analysis = await analyze_one(llm, summary)
-    return {"analyses": {pid: analysis}}
-
-
-async def partner_chart(state: PartnerPipelineState) -> dict[str, Any]:
-    from pathlib import Path
-
-    pid = state["partner_id"]
-    summary = state["summary"]
-    ctx = get_pipeline_ctx()
-    out_dir = Path(ctx["out_dir"]) / "partners" / pid
-    chart_list = render_partner_charts(summary, out_dir)
-    analyses = state.get("analyses") or {}
-    analysis = analyses.get(pid) if isinstance(analyses, dict) else None
-    if analysis and getattr(analysis, "recommended_actions", None):
-        chart_list[0].title = (
-            f"Success rate by gateway -- recommended: "
-            f"{analysis.recommended_actions[0][:60]}"
-        )
-    return {"charts": {pid: chart_list}}
-
-
-async def partner_email(state: PartnerPipelineState) -> dict[str, Any]:
-    pid = state["partner_id"]
-    summary = state["summary"]
-    analyses = state.get("analyses") or {}
-    charts = state.get("charts") or {}
-    analysis = analyses.get(pid) if isinstance(analyses, dict) else None
-    chart_list = charts.get(pid) if isinstance(charts, dict) else None
-
-    if analysis is None:
-        analysis = fallback_analysis(summary)
-    if chart_list is None:
-        chart_list = []
-
-    meta = PartnerMeta(
-        partner_id=summary.partner_id,
-        partner_name=summary.partner_name,
-        contact_email=summary.contact_email,
-    )
-    ctx = get_pipeline_ctx()
-    llm = LLMClient(disabled=bool(ctx.get("dry_run")))
-    try:
-        data = llm.complete_json(
-            EMAIL_SYSTEM,
-            email_user_prompt(
-                meta.partner_name,
-                meta.tone,
-                analysis.model_dump_json(indent=2),
-                [c.title for c in chart_list],
-            ),
-        )
-        email = EmailOutput.model_validate(data)
-    except Exception as e:  # noqa: BLE001
-        log.warning("partner_email.fallback partner=%s reason=%s", pid, e)
-        email = fallback_email(summary, analysis)
-    return {"email_bodies": {pid: email}}
-
-
 __all__ = [
-    "get_partner_ctx",
-    "partner_analyze",
-    "partner_chart",
-    "partner_email",
+    "get_pipeline_ctx",
     "partner_pipeline_node",
     "set_pipeline_ctx",
 ]
-
-
-def get_partner_ctx() -> dict[str, Any]:
-    return _PIPELINE_CTX

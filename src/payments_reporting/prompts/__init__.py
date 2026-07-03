@@ -1,8 +1,8 @@
 """Prompt templates for the LLM nodes.
 
 Voice rules (apply to every prompt and every generated artefact):
-- No em-dashes anywhere. ASCII "--" or rephrase.
-- Short sentences.
+- No em-dashes anywhere. ASCII "--" only.
+- Short sentences. No "I dug into this."
 - Name the document / metric before the partner.
 - Grounded in the metrics JSON; no inventing numbers.
 """
@@ -14,9 +14,9 @@ from textwrap import dedent
 
 ANALYSIS_SYSTEM = (
     "You are a payments SRE analyst writing a weekly health note for a "
-    "partner integration owner. You are concise, evidence-driven, and you "
-    "never invent numbers. If the metrics do not support a claim, you say "
-    '"no notable signal" instead of speculating.'
+    "partner integration owner. You are concise, evidence-driven, and "
+    "you never invent numbers. If the metrics do not support a claim, "
+    'you say "no notable signal" instead of speculating.'
 )
 
 
@@ -25,16 +25,18 @@ def analysis_user_prompt(summary_json: str, partner_name: str) -> str:
         f"""
         Partner: {partner_name}
 
-        Below is the JSON summary of last week's payment traffic for this
-        partner. Produce a structured JSON response with exactly these keys:
+        Below is the JSON summary of last week's payment traffic for
+        this partner. Produce a structured JSON response with exactly
+        these keys:
 
         - "overview": one paragraph, two or three sentences, the headline.
-        - "key_issues": list of strings, up to four. Each must reference a
-          specific number from the JSON (gateway, region, error code).
+        - "key_issues": list of strings, up to four. Each must reference
+          a specific number from the JSON (gateway, region, error code).
         - "likely_causes": list of strings, up to three. Hypotheses only,
           grounded in the failure buckets and trend deltas.
-        - "recommended_actions": list of strings, up to four. Concrete and
-          testable (e.g. "replay 12 stuck Braintree charges from EU on 2026-06-29").
+        - "recommended_actions": list of strings, up to four. Concrete
+          and testable (e.g. "replay 12 stuck Braintree charges from EU
+          on 2026-06-29").
 
         Rules:
         - Do not invent numbers. If you cannot ground a claim, omit it.
@@ -50,10 +52,10 @@ def analysis_user_prompt(summary_json: str, partner_name: str) -> str:
 
 
 EMAIL_SYSTEM = (
-    "You are a payments platform team lead writing a weekly status email "
-    "to a partner integration owner. You are professional, specific, and "
-    "you never oversell. You cite numbers from the supplied context; you "
-    "do not invent them."
+    "You are a payments platform team lead writing a weekly status "
+    "email to a partner integration owner. You are professional, "
+    "specific, and you never oversell. You cite numbers from the "
+    "supplied context; you do not invent them."
 )
 
 
@@ -90,8 +92,8 @@ def email_user_prompt(
         Constraints:
         - Embed the charts by referencing them as plain-text lines like
           "(see chart: Success rate by gateway)". Do not invent URLs.
-        - Inline CSS only. No external assets. Body must render in Gmail
-          and Outlook desktop.
+        - Inline CSS only. No external assets. Body must render in
+          Gmail and Outlook desktop.
         - No em-dashes. Use ASCII punctuation only.
         - Total body length: under 350 words.
 
@@ -104,3 +106,11 @@ def email_user_prompt(
         ```
         """
     ).strip()
+
+
+__all__ = [
+    "ANALYSIS_SYSTEM",
+    "EMAIL_SYSTEM",
+    "analysis_user_prompt",
+    "email_user_prompt",
+]

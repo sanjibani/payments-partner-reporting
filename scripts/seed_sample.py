@@ -1,10 +1,6 @@
 """Generate a realistic 2-week sample CSV for local development.
 
-Run:
-    python scripts/run_local.py --seed
-
-Output:
-    data/sample_week.csv  (~3000 rows, 3 partners, mixed success/failure)
+Run via the CLI: `python scripts/run_local.py --seed`.
 """
 
 from __future__ import annotations
@@ -20,16 +16,12 @@ OUT = ROOT / "data" / "sample_week.csv"
 PARTNERS = ["P-001", "P-002", "P-003"]
 REGIONS = {"P-001": "EU", "P-002": "APAC", "P-003": "LATAM"}
 GATEWAYS = ["stripe", "braintree"]
-
-# Per-gateway baseline success rate (this week vs last week shows a
-# realistic anomaly: Braintree EU dips mid-period).
 FAILURE_CODES = {
     "stripe": ["200", "card_declined", "insufficient_funds", "3ds_failed"],
     "braintree": ["200", "processor_timeout", "gateway_unavailable", "avs_mismatch"],
 }
 
-# Anomaly window: Braintree EU has a transient failure spike from
-# 2026-06-23 to 2026-06-25. Last week stays clean.
+# Anomaly window: Braintree EU has a transient failure spike.
 ANOMALY_START = datetime(2026, 6, 23, 0, 0, tzinfo=timezone.utc)
 ANOMALY_END = datetime(2026, 6, 26, 0, 0, tzinfo=timezone.utc)
 
@@ -37,14 +29,12 @@ ANOMALY_END = datetime(2026, 6, 26, 0, 0, tzinfo=timezone.utc)
 def _generate_rows() -> list[dict[str, str]]:
     random.seed(42)
     rows: list[dict[str, str]] = []
-    # Two full weeks of hourly traffic
     start = datetime(2026, 6, 15, 0, 0, tzinfo=timezone.utc)
     end = datetime(2026, 6, 29, 0, 0, tzinfo=timezone.utc)
     cursor = start
     while cursor < end:
         for partner in PARTNERS:
             for gw in GATEWAYS:
-                # baseline volume per partner/gateway/hour
                 volume = random.randint(3, 8)
                 for _ in range(volume):
                     success_p = 0.95
@@ -55,10 +45,14 @@ def _generate_rows() -> list[dict[str, str]]:
                         and partner == "P-001"
                         and ANOMALY_START <= cursor < ANOMALY_END
                     ):
-                        success_p = 0.55  # spike
+                        success_p = 0.55
                     success = random.random() < success_p
                     code = "200" if success else random.choice(FAILURE_CODES[gw][1:])
-                    latency = random.randint(120, 480) if success else random.randint(900, 2500)
+                    latency = (
+                        random.randint(120, 480)
+                        if success
+                        else random.randint(900, 2500)
+                    )
                     rows.append(
                         {
                             "timestamp": cursor.isoformat(),

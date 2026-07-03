@@ -1,4 +1,10 @@
-"""Shared node timing + error helpers."""
+"""Main-graph node timing and error capture wrapper.
+
+Each main-graph node is wrapped in run_node() so a single node failure
+appends to state.errors and returns a partial instead of crashing the
+graph. Per-node duration is included in the returned partial so
+LangGraph merges it into the running state.
+"""
 
 from __future__ import annotations
 
@@ -13,17 +19,11 @@ async def run_node(
     name: str,
     fn: Callable[[GraphState], Awaitable[dict]],
 ) -> dict:
-    """Wrap a node with timing + error capture.
-
-    Nodes are typed as `(state) -> partial state`. They never raise; on
-    failure they append to `state.errors` and return a partial so the
-    rest of the graph can still run. Timing is returned in the partial
-    so LangGraph merges it into the running state.
-    """
+    """Wrap a node with timing + error capture."""
     t0 = time.perf_counter()
     try:
         partial = await fn(state)
-    except Exception as e:  # noqa: BLE001  --  nodes are the failure boundary
+    except Exception as e:  # noqa: BLE001 -- nodes are the failure boundary
         errs = list(state.get("errors") or [])
         errs.append(f"{name}: {type(e).__name__}: {e}")
         partial = {"errors": errs}
@@ -34,3 +34,6 @@ async def run_node(
         partial = dict(partial or {})
         partial["node_durations_ms"] = durations
     return partial
+
+
+__all__ = ["run_node"]
