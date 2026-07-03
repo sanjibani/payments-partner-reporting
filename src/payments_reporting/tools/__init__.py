@@ -1,0 +1,1 @@
+"""Tooling: external integrations (App Insights KQL, SMTP)."""

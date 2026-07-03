@@ -1,0 +1,79 @@
+# Build
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "payments-partner-reporting"
+version = "0.1.0"
+description = "Weekly LangGraph workflow that ships partner-specific payments analytics via email."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "sanjibani" }]
+keywords = ["langgraph", "payments", "analytics", "azure", "agentic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "pydantic-core==2.41.5",
+    "pydantic>=2.6",
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "openai>=1.30",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "pandas>=2.2",
+    "matplotlib>=3.8",
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+    "typer>=0.12",
+    "rich>=13.7",
+    "structlog>=24.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "respx>=0.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/sanjibani/payments-partner-reporting"
+Issues = "https://github.com/sanjibani/payments-partner-reporting/issues"
+
+[tool.hatch.version]
+path = "src/payments_reporting/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/payments_reporting"]
+include = ["src/payments_reporting/py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "DTZ", "T20", "PT", "Q", "RET", "SIM", "TID", "ARG", "PTH", "ERA", "PL", "RUF"]
+ignore = ["PLR0913", "PLR2004"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers --strict-config"
+markers = ["integration", "live"]
+
+[tool.mypy]
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true

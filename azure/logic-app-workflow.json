@@ -1,0 +1,72 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "definition": {
+    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+    "actions": {
+      "Call_run_weekly": {
+        "inputs": {
+          "body": {
+            "dry_run": false
+          },
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "method": "POST",
+          "uri": "@parameters('containerAppUrl')"
+        },
+        "runAfter": {},
+        "type": "Http"
+      },
+      "Send_failure_alert": {
+        "inputs": {
+          "body": "@{body('Call_run_weekly')}",
+          "headers": {
+            "Content-Type": "application/json"
+          },
+          "method": "POST",
+          "uri": "@parameters('alertWebhookUrl')"
+        },
+        "runAfter": {
+          "Call_run_weekly": [
+            "FAILED",
+            "TIMEDOUT"
+          ]
+        },
+        "type": "Http"
+      }
+    },
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+      "containerAppUrl": {
+        "defaultValue": "https://ca-payrep-prod.<region>.azurecontainerapps.io/run-weekly",
+        "type": "String"
+      },
+      "alertWebhookUrl": {
+        "defaultValue": "https://example.com/alerts/payments-reporting",
+        "type": "String"
+      }
+    },
+    "triggers": {
+      "Weekly_recurrence": {
+        "recurrence": {
+          "frequency": "Week",
+          "interval": 1,
+          "schedule": {
+            "hours": [
+              "6"
+            ],
+            "minutes": [
+              "0"
+            ],
+            "weekDays": [
+              "Monday"
+            ]
+          },
+          "timeZone": "UTC"
+        },
+        "type": "Recurrence"
+      }
+    }
+  },
+  "parameters": {}
+}
